@@ -1,59 +1,80 @@
 #!/usr/bin/env python3
 """
-Script para clustering incremental con HDBSCAN.
-
-Uso:
-    python 03.build_topics_hdbscan.py --incremental
-    python 03.build_topics_hdbscan.py --full-rebuild
+03. Build Topics HDBSCAN - Topic Clustering
+Clusters documents into topics using HDBSCAN on FAISS embeddings.
+Updates PostgreSQL with cluster assignments.
 """
-import argparse
-import sys
+
+import os
 import json
+import time
 import numpy as np
 import faiss
-from sklearn.cluster import HDBSCAN
-from typing import List
+from typing import Dict, List, Tuple
+import hdbscan
+from sklearn.feature_extraction.text import TfidfVectorizer
+import psycopg2
+from psycopg2.extras import execute_values
 
-sys.path.insert(0, ".")
-from app.db import get_conn
-
-INDEX_PATH = "models_semantic/faiss.index"
-UUID_MAP_PATH = "models_semantic/uuid_map.json"
+# Configuration
+MODEL_DIR = "models_semantic"
+INDEX_PATH = os.path.join(MODEL_DIR, "faiss.index")
+UUID_MAP_PATH = os.path.join(MODEL_DIR, "uuid_map.json")
 MODEL_NAME = "BAAI/bge-m3"
 
+# HDBSCAN parameters
+MIN_CLUSTER_SIZE = 5
+MIN_SAMPLES = 3
+CLUSTER_SELECTION_EPSILON = 0.0
 
-def load_embeddings():
-    """Cargar embeddings desde FAISS index."""
+def get_db_connection():
+    """Get PostgreSQL connection"""
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        raise ValueError("DATABASE_URL not set")
+    return psycopg2.connect(database_url)
+
+def load_index_and_mappings() -> Tuple[np.ndarray, Dict[str, str]]:
+    """
+    Load FAISS index and UUID mappings
+    
+    Returns:
+        Tuple of (embeddings, uuid_map)
+    """
+    print("  📂 Loading FAISS index...")
     index = faiss.read_index(INDEX_PATH)
     
-    # Extraer todos los vectores
-    vectors = np.zeros((index.ntotal, index.d), dtype='float32')
+    # Extract all vectors
+    embeddings = np.zeros((index.ntotal, index.d), dtype="float32")
     for i in range(index.ntotal):
-        vectors[i] = index.reconstruct(int(i))
+        embeddings[i] = index.reconstruct(i)
     
-    return vectors, index.ntotal
-
-
-def load_uuid_map():
-    """Cargar mapeo UUID -> índice."""
-    with open(UUID_MAP_PATH) as f:
+    with open(UUID_MAP_PATH, "r") as f:
         uuid_map = json.load(f)
     
-    # Invertir el mapeo: índice -> UUID
-    idx_to_uuid = {v: k for k, v in uuid_map.items()}
-    return idx_to_uuid
+    print(f"  ✓ Loaded {len(embeddings)} vectors")
+    return embeddings, uuid_map
 
-
-def cluster_embeddings(embeddings: np.ndarray, min_cluster_size: int = 5):
-    """Aplicar HDBSCAN clustering."""
-    print(f"🔬 Aplicando HDBSCAN (min_cluster_size={min_cluster_size})...")
+def perform_clustering(embeddings: np.ndarray) -> np.ndarray:
+    """
+    Cluster embeddings using HDBSCAN
     
-    clusterer = HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=3,
-        metric='euclidean',
-        cluster_selection_method='eom',
-        prediction_data=True
+    Args:
+        embeddings: Document embeddings
+    
+    Returns:
+        Cluster labels array
+    """
+    print(f"  🎯 Clustering with HDBSCAN...")
+    print(f"     - min_cluster_size: {MIN_CLUSTER_SIZE}")
+    print(f"     - min_samples: {MIN_SAMPLES}")
+    
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=MIN_CLUSTER_SIZE,
+        min_samples=MIN_SAMPLES,
+        cluster_selection_epsilon=CLUSTER_SELECTION_EPSILON,
+        metric="cosine",
+        core_dist_n_jobs=-1
     )
     
     labels = clusterer.fit_predict(embeddings)
@@ -61,171 +82,179 @@ def cluster_embeddings(embeddings: np.ndarray, min_cluster_size: int = 5):
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     n_noise = list(labels).count(-1)
     
-    print(f"✅ Clusters encontrados: {n_clusters}")
-    print(f"   Ruido: {n_noise} items ({n_noise/len(labels)*100:.1f}%)")
+    print(f"  ✅ Found {n_clusters} clusters")
+    print(f"     - Noise points: {n_noise}")
     
     return labels
 
-
-def update_cluster_assignments(conn, idx_to_uuid: dict, labels: np.ndarray):
-    """Actualizar asignaciones de cluster en la DB."""
-    print("💾 Actualizando asignaciones en la base de datos...")
+def generate_cluster_labels(conn, uuid_map: Dict[str, str], labels: np.ndarray) -> Dict[int, str]:
+    """
+    Generate human-readable labels for clusters using TF-IDF
     
-    with conn.cursor() as cur:
-        # Limpiar clusters anteriores
-        cur.execute(
-            "DELETE FROM clusters WHERE model_name = %s",
-            (MODEL_NAME,)
-        )
+    Args:
+        conn: Database connection
+        uuid_map: Mapping from index to UUID
+        labels: Cluster labels
+    
+    Returns:
+        Dictionary mapping cluster_id to label
+    """
+    print("  🏷️  Generating cluster labels...")
+    
+    # Group UUIDs by cluster
+    clusters = {}
+    for idx, label in enumerate(labels):
+        if label == -1:
+            continue
         
-        # Insertar nuevas asignaciones
-        inserted = 0
-        for idx, label in enumerate(labels):
-            if label == -1:  # Skip noise
-                continue
-            
-            uuid = idx_to_uuid.get(idx)
-            if not uuid:
-                continue
-            
+        uuid = uuid_map[str(idx)]
+        if label not in clusters:
+            clusters[label] = []
+        clusters[label].append(uuid)
+    
+    # Fetch texts for each cluster
+    cluster_labels = {}
+    
+    for cluster_id, uuids in clusters.items():
+        # Fetch titles for this cluster
+        with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO clusters (uuid, cluster_id, model_name)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (uuid, model_name) 
-                DO UPDATE SET cluster_id = EXCLUDED.cluster_id
+                SELECT title_norm
+                FROM items
+                WHERE uuid = ANY(%s)
                 """,
-                (uuid, int(label), MODEL_NAME)
+                (uuids,)
             )
-            inserted += 1
+            texts = [row[0] for row in cur.fetchall() if row[0]]
         
-        conn.commit()
-        print(f"✅ Actualizadas {inserted} asignaciones")
-
-
-def generate_cluster_labels(conn):
-    """
-    Generar etiquetas automáticas para clusters basándose en términos frecuentes.
+        if not texts:
+            cluster_labels[cluster_id] = f"Cluster {cluster_id}"
+            continue
+        
+        # Use TF-IDF to find representative terms
+        try:
+            vectorizer = TfidfVectorizer(
+                max_features=10,
+                stop_words=None,
+                ngram_range=(1, 2)
+            )
+            vectorizer.fit(texts)
+            
+            # Get top 3 terms
+            feature_names = vectorizer.get_feature_names_out()
+            top_terms = feature_names[:3]
+            label = " + ".join(top_terms)
+            
+            cluster_labels[cluster_id] = label
+        except:
+            cluster_labels[cluster_id] = f"Cluster {cluster_id}"
     
-    NOTA: Implementación simplificada. 
-    Idealmente usarías TF-IDF o extracción de keywords.
+    print(f"  ✅ Generated {len(cluster_labels)} cluster labels")
+    return cluster_labels
+
+def save_clusters_to_db(conn, uuid_map: Dict[str, str], labels: np.ndarray, cluster_labels: Dict[int, str]):
     """
-    print("🏷️  Generando etiquetas de clusters...")
+    Save cluster assignments to database
+    
+    Args:
+        conn: Database connection
+        uuid_map: Mapping from index to UUID
+        labels: Cluster labels
+        cluster_labels: Human-readable cluster labels
+    """
+    print("  💾 Saving clusters to database...")
+    
+    # Clear existing clusters for this model
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM clusters WHERE model_name = %s", (MODEL_NAME,))
+        cur.execute("DELETE FROM cluster_labels WHERE model_name = %s", (MODEL_NAME,))
+    
+    # Insert cluster assignments
+    cluster_values = []
+    for idx, label in enumerate(labels):
+        if label == -1:
+            continue
+        
+        uuid = uuid_map[str(idx)]
+        cluster_values.append((uuid, MODEL_NAME, int(label)))
     
     with conn.cursor() as cur:
-        # Obtener clusters únicos
-        cur.execute(
+        execute_values(
+            cur,
             """
-            SELECT DISTINCT cluster_id
-            FROM clusters
-            WHERE model_name = %s
-            ORDER BY cluster_id
+            INSERT INTO clusters (uuid, model_name, cluster_id)
+            VALUES %s
+            ON CONFLICT (uuid, model_name) DO UPDATE
+            SET cluster_id = EXCLUDED.cluster_id
             """,
-            (MODEL_NAME,)
+            cluster_values
         )
-        cluster_ids = [row[0] for row in cur.fetchall()]
-        
-        # Para cada cluster, generar label basado en títulos comunes
-        for cluster_id in cluster_ids:
-            cur.execute(
-                """
-                SELECT i.title
-                FROM items i
-                JOIN clusters c ON c.uuid = i.uuid
-                WHERE c.cluster_id = %s AND c.model_name = %s
-                LIMIT 10
-                """,
-                (cluster_id, MODEL_NAME)
-            )
-            titles = [row[0] for row in cur.fetchall() if row[0]]
-            
-            # Generar label simple (primeras palabras del título más común)
-            if titles:
-                # Tomar palabras más frecuentes (implementación simple)
-                words = []
-                for title in titles:
-                    words.extend(title.lower().split()[:3])
-                
-                # Contar frecuencias
-                from collections import Counter
-                common = Counter(words).most_common(3)
-                label = " ".join([w for w, _ in common if len(w) > 3])[:50]
-                
-                if not label:
-                    label = f"Cluster {cluster_id}"
-            else:
-                label = f"Cluster {cluster_id}"
-            
-            # Guardar label
-            cur.execute(
-                """
-                INSERT INTO cluster_labels (model_name, cluster_id, label)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (model_name, cluster_id)
-                DO UPDATE SET label = EXCLUDED.label
-                """,
-                (MODEL_NAME, cluster_id, label)
-            )
-        
-        conn.commit()
-        print(f"✅ Generadas {len(cluster_ids)} etiquetas")
-
+    
+    # Insert cluster labels
+    label_values = [
+        (MODEL_NAME, cluster_id, label)
+        for cluster_id, label in cluster_labels.items()
+    ]
+    
+    with conn.cursor() as cur:
+        execute_values(
+            cur,
+            """
+            INSERT INTO cluster_labels (model_name, cluster_id, label)
+            VALUES %s
+            ON CONFLICT (model_name, cluster_id) DO UPDATE
+            SET label = EXCLUDED.label
+            """,
+            label_values
+        )
+    
+    conn.commit()
+    print(f"  ✅ Saved {len(cluster_values)} cluster assignments")
+    print(f"  ✅ Saved {len(label_values)} cluster labels")
 
 def main():
-    parser = argparse.ArgumentParser(description="Build topic clusters with HDBSCAN")
-    parser.add_argument(
-        "--incremental",
-        action="store_true",
-        help="Reclustear con nuevos items"
-    )
-    parser.add_argument(
-        "--full-rebuild",
-        action="store_true",
-        help="Reconstruir clusters completamente"
-    )
-    parser.add_argument(
-        "--min-cluster-size",
-        type=int,
-        default=5,
-        help="Tamaño mínimo de cluster"
-    )
+    """Main clustering process"""
+    print("=" * 60)
+    print("📊 BUILD TOPICS HDBSCAN - Topic Clustering")
+    print("=" * 60)
     
-    args = parser.parse_args()
+    start_time = time.time()
     
-    if not args.incremental and not args.full_rebuild:
-        print("❌ Debes especificar --incremental o --full-rebuild")
-        return 1
+    # Load index and mappings
+    print("\n📂 Loading data...")
+    embeddings, uuid_map = load_index_and_mappings()
     
-    print("🚀 Iniciando clustering...")
+    # Perform clustering
+    print("\n🎯 Clustering...")
+    labels = perform_clustering(embeddings)
     
-    # Cargar embeddings
-    print("📥 Cargando embeddings desde FAISS...")
-    embeddings, n_vectors = load_embeddings()
-    print(f"✅ Cargados {n_vectors} vectores")
+    # Connect to database
+    conn = get_db_connection()
     
-    # Cargar UUID map
-    idx_to_uuid = load_uuid_map()
+    # Generate cluster labels
+    print("\n🏷️  Generating labels...")
+    cluster_labels = generate_cluster_labels(conn, uuid_map, labels)
     
-    # Aplicar clustering
-    labels = cluster_embeddings(embeddings, args.min_cluster_size)
+    # Save to database
+    print("\n💾 Saving to database...")
+    save_clusters_to_db(conn, uuid_map, labels, cluster_labels)
     
-    # Conectar a DB
-    conn = get_conn()
+    conn.close()
     
-    try:
-        # Actualizar asignaciones
-        update_cluster_assignments(conn, idx_to_uuid, labels)
-        
-        # Generar labels
-        generate_cluster_labels(conn)
-        
-        print("✅ Clustering completado exitosamente")
+    elapsed_time = time.time() - start_time
     
-    finally:
-        conn.close()
+    # Print summary
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    n_noise = list(labels).count(-1)
     
-    return 0
-
+    print("\n" + "=" * 60)
+    print("✅ CLUSTERING COMPLETED")
+    print("=" * 60)
+    print(f"📊 Total documents: {len(labels)}")
+    print(f"🎯 Clusters found: {n_clusters}")
+    print(f"🔇 Noise points: {n_noise}")
+    print(f"⏱️  Time: {elapsed_time:.2f}s")
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

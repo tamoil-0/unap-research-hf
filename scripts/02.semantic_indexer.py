@@ -1,172 +1,247 @@
 #!/usr/bin/env python3
 """
-Script para indexación semántica incremental usando BAAI/bge-m3.
-
-Uso:
-    python 02.semantic_indexer.py --incremental
-    python 02.semantic_indexer.py --full-rebuild
+02. Semantic Indexer - FAISS Index Builder
+Builds/updates semantic search index using sentence-transformers and FAISS.
+Handles incremental updates efficiently.
 """
-import argparse
-import sys
+
+import os
 import json
+import time
 import numpy as np
 import faiss
+from typing import List, Dict, Tuple
 from sentence_transformers import SentenceTransformer
-from typing import List, Tuple
+import psycopg2
 
-sys.path.insert(0, ".")
-from app.db import get_conn
-
+# Configuration
 MODEL_NAME = "BAAI/bge-m3"
-INDEX_PATH = "models_semantic/faiss.index"
-UUID_MAP_PATH = "models_semantic/uuid_map.json"
-META_PATH = "models_semantic/meta.json"
+MODEL_DIR = "models_semantic"
+INDEX_PATH = os.path.join(MODEL_DIR, "faiss.index")
+UUID_MAP_PATH = os.path.join(MODEL_DIR, "uuid_map.json")
+META_PATH = os.path.join(MODEL_DIR, "meta.json")
 
+os.makedirs(MODEL_DIR, exist_ok=True)
 
-def load_existing_index():
-    """Cargar índice existente y uuid_map."""
-    try:
-        index = faiss.read_index(INDEX_PATH)
-        with open(UUID_MAP_PATH) as f:
-            uuid_map = json.load(f)
-        print(f"📥 Índice existente: {index.ntotal} vectores")
-        return index, uuid_map
-    except FileNotFoundError:
-        print("⚠️  No se encontró índice existente, creando nuevo...")
-        return None, {}
+def get_db_connection():
+    """Get PostgreSQL connection"""
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        raise ValueError("DATABASE_URL not set")
+    return psycopg2.connect(database_url)
 
+def load_existing_index() -> Tuple[faiss.Index, Dict[int, str], set]:
+    """
+    Load existing FAISS index and mappings
+    
+    Returns:
+        Tuple of (index, uuid_map, indexed_uuids)
+    """
+    if not os.path.exists(INDEX_PATH):
+        print("  ℹ️ No existing index found, creating new one")
+        return None, {}, set()
+    
+    print("  📂 Loading existing index...")
+    index = faiss.read_index(INDEX_PATH)
+    
+    with open(UUID_MAP_PATH, "r") as f:
+        uuid_map = json.load(f)
+    
+    indexed_uuids = set(uuid_map.values())
+    
+    print(f"  ✓ Loaded index with {index.ntotal} vectors")
+    return index, uuid_map, indexed_uuids
 
-def get_unindexed_items(conn, existing_uuids: List[str]) -> List[Tuple[str, str]]:
-    """Obtener items que no están en el índice."""
+def fetch_items_to_index(conn, indexed_uuids: set) -> List[Dict]:
+    """
+    Fetch items that need indexing
+    
+    Args:
+        conn: Database connection
+        indexed_uuids: Set of already indexed UUIDs
+    
+    Returns:
+        List of items to index
+    """
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT uuid, 
-                   COALESCE(title || ' ' || abstract_norm, title, abstract_norm, '') as text
-            FROM items
-            WHERE uuid NOT IN %s
-            AND (title IS NOT NULL OR abstract_norm IS NOT NULL)
-            """,
-            (tuple(existing_uuids) if existing_uuids else ('',),)
+        if indexed_uuids:
+            cur.execute(
+                """
+                SELECT uuid, title_norm, abstract_norm 
+                FROM items 
+                WHERE uuid NOT IN %s
+                AND abstract_norm IS NOT NULL
+                AND abstract_norm != ''
+                """,
+                (tuple(indexed_uuids),)
+            )
+        else:
+            cur.execute(
+                """
+                SELECT uuid, title_norm, abstract_norm 
+                FROM items
+                WHERE abstract_norm IS NOT NULL
+                AND abstract_norm != ''
+                """
+            )
+        
+        rows = cur.fetchall()
+    
+    items = [
+        {
+            "uuid": row[0],
+            "title": row[1] or "",
+            "abstract": row[2] or ""
+        }
+        for row in rows
+    ]
+    
+    return items
+
+def build_or_update_index(
+    model: SentenceTransformer,
+    items: List[Dict],
+    existing_index: faiss.Index = None,
+    existing_uuid_map: Dict[int, str] = None
+) -> Tuple[faiss.Index, Dict[int, str]]:
+    """
+    Build new index or update existing one
+    
+    Args:
+        model: Sentence transformer model
+        items: Items to index
+        existing_index: Existing FAISS index (optional)
+        existing_uuid_map: Existing UUID mapping (optional)
+    
+    Returns:
+        Tuple of (updated_index, updated_uuid_map)
+    """
+    if not items:
+        print("  ℹ️ No new items to index")
+        return existing_index, existing_uuid_map
+    
+    print(f"  🧠 Encoding {len(items)} items...")
+    
+    # Prepare texts (title + abstract)
+    texts = [f"{item['title']} {item['abstract']}" for item in items]
+    
+    # Encode in batches
+    batch_size = 32
+    embeddings = []
+    
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        batch_embeddings = model.encode(
+            batch,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=batch_size
         )
-        return cur.fetchall()
+        embeddings.append(batch_embeddings)
+        
+        if (i // batch_size + 1) % 10 == 0:
+            print(f"    ✓ Processed {i + len(batch)}/{len(texts)} items")
+    
+    embeddings = np.vstack(embeddings).astype("float32")
+    print(f"  ✅ Embeddings shape: {embeddings.shape}")
+    
+    # Create or update index
+    dim = embeddings.shape[1]
+    
+    if existing_index is None:
+        # Create new index
+        print("  🔧 Creating new FAISS index...")
+        index = faiss.IndexFlatIP(dim)  # Inner product (cosine similarity)
+        uuid_map = {}
+        start_idx = 0
+    else:
+        # Use existing index
+        print("  🔧 Updating existing FAISS index...")
+        index = existing_index
+        uuid_map = existing_uuid_map.copy()
+        start_idx = index.ntotal
+    
+    # Add new vectors
+    index.add(embeddings)
+    
+    # Update UUID mapping
+    for i, item in enumerate(items):
+        uuid_map[str(start_idx + i)] = item["uuid"]
+    
+    print(f"  ✅ Index now contains {index.ntotal} vectors")
+    return index, uuid_map
 
-
-def encode_texts(model: SentenceTransformer, texts: List[str], batch_size: int = 32):
-    """Encode texts en batches."""
-    embeddings = model.encode(
-        texts,
-        batch_size=batch_size,
-        show_progress_bar=True,
-        convert_to_numpy=True,
-        normalize_embeddings=True
-    )
-    return embeddings.astype("float32")
-
+def save_index(index: faiss.Index, uuid_map: Dict[int, str]):
+    """Save FAISS index and mappings"""
+    print("  💾 Saving index...")
+    
+    faiss.write_index(index, INDEX_PATH)
+    
+    with open(UUID_MAP_PATH, "w") as f:
+        json.dump(uuid_map, f, indent=2)
+    
+    # Save metadata
+    meta = {
+        "model": MODEL_NAME,
+        "dimension": index.d,
+        "total_vectors": index.ntotal,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+    }
+    
+    with open(META_PATH, "w") as f:
+        json.dump(meta, f, indent=2)
+    
+    print(f"  ✅ Saved: {INDEX_PATH}")
+    print(f"  ✅ Saved: {UUID_MAP_PATH}")
+    print(f"  ✅ Saved: {META_PATH}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Semantic indexing incremental")
-    parser.add_argument(
-        "--incremental",
-        action="store_true",
-        help="Solo indexar nuevos items"
-    )
-    parser.add_argument(
-        "--full-rebuild",
-        action="store_true",
-        help="Reconstruir índice completo"
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=32,
-        help="Batch size para encoding"
-    )
+    """Main indexing process"""
+    print("=" * 60)
+    print("🧠 SEMANTIC INDEXER - FAISS Index Builder")
+    print("=" * 60)
     
-    args = parser.parse_args()
+    start_time = time.time()
     
-    if not args.incremental and not args.full_rebuild:
-        print("❌ Debes especificar --incremental o --full-rebuild")
-        return 1
-    
-    print(f"🚀 Iniciando indexación {'incremental' if args.incremental else 'completa'}...")
-    
-    # Cargar modelo
-    print(f"📦 Cargando modelo {MODEL_NAME}...")
+    # Load model
+    print(f"\n📥 Loading model: {MODEL_NAME}")
     model = SentenceTransformer(MODEL_NAME)
-    dim = model.get_sentence_embedding_dimension()
-    print(f"✅ Modelo cargado (dim={dim})")
+    print(f"✅ Model loaded (dim: {model.get_sentence_embedding_dimension()})")
     
-    # Conectar a DB
-    conn = get_conn()
+    # Load existing index
+    print("\n📂 Loading existing index...")
+    existing_index, existing_uuid_map, indexed_uuids = load_existing_index()
     
-    try:
-        # Cargar índice existente si es incremental
-        if args.incremental:
-            index, uuid_map = load_existing_index()
-            existing_uuids = list(uuid_map.keys())
-        else:
-            index = None
-            uuid_map = {}
-            existing_uuids = []
-        
-        # Obtener items no indexados
-        print("🔍 Buscando items no indexados...")
-        unindexed = get_unindexed_items(conn, existing_uuids)
-        print(f"📊 Items para indexar: {len(unindexed)}")
-        
-        if not unindexed:
-            print("✅ Todos los items ya están indexados")
-            return 0
-        
-        # Extraer UUIDs y textos
-        new_uuids = [row[0] for row in unindexed]
-        new_texts = [row[1] for row in unindexed]
-        
-        # Encode
-        print("🧠 Generando embeddings...")
-        new_embeddings = encode_texts(model, new_texts, args.batch_size)
-        
-        # Crear o actualizar índice
-        if index is None:
-            print("🏗️  Creando nuevo índice FAISS...")
-            index = faiss.IndexFlatIP(dim)  # Inner Product (cosine con vectores normalizados)
-        
-        # Agregar vectores
-        start_idx = index.ntotal
-        index.add(new_embeddings)
-        print(f"✅ Agregados {len(new_embeddings)} vectores")
-        
-        # Actualizar uuid_map
-        for i, uuid in enumerate(new_uuids):
-            uuid_map[uuid] = start_idx + i
-        
-        # Guardar
-        print("💾 Guardando índice...")
-        faiss.write_index(index, INDEX_PATH)
-        
-        with open(UUID_MAP_PATH, "w") as f:
-            json.dump(uuid_map, f)
-        
-        with open(META_PATH, "w") as f:
-            json.dump({
-                "model_name": MODEL_NAME,
-                "dim": dim,
-                "total_vectors": index.ntotal,
-                "last_updated": str(np.datetime64('now'))
-            }, f, indent=2)
-        
-        print(f"✅ Índice actualizado: {index.ntotal} vectores totales")
-        print(f"📁 Archivos guardados:")
-        print(f"  - {INDEX_PATH}")
-        print(f"  - {UUID_MAP_PATH}")
-        print(f"  - {META_PATH}")
+    # Connect to database and fetch new items
+    print("\n🔍 Fetching items to index...")
+    conn = get_db_connection()
+    items_to_index = fetch_items_to_index(conn, indexed_uuids)
+    conn.close()
     
-    finally:
-        conn.close()
+    print(f"  ✓ Found {len(items_to_index)} new items to index")
     
-    return 0
-
+    if not items_to_index and existing_index is not None:
+        print("\n✅ Index is up to date, nothing to do")
+        return
+    
+    # Build/update index
+    print("\n🔧 Building/updating index...")
+    index, uuid_map = build_or_update_index(
+        model, items_to_index, existing_index, existing_uuid_map
+    )
+    
+    # Save index
+    print("\n💾 Saving index...")
+    save_index(index, uuid_map)
+    
+    elapsed_time = time.time() - start_time
+    
+    print("\n" + "=" * 60)
+    print("✅ INDEXING COMPLETED")
+    print("=" * 60)
+    print(f"📊 Total vectors: {index.ntotal}")
+    print(f"🆕 New vectors: {len(items_to_index)}")
+    print(f"⏱️  Time: {elapsed_time:.2f}s")
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

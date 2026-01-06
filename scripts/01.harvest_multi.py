@@ -1,200 +1,227 @@
 #!/usr/bin/env python3
 """
-Script para harvesting de repositorios UNAP/UNSA con soporte incremental.
-
-Uso:
-    python 01.harvest_multi.py --university UNAP --check-new
-    python 01.harvest_multi.py --university UNSA --full-sync
+01. Harvest Multi - DSpace Repository Harvester
+Harvests metadata from UNAP and UNSA DSpace repositories.
+Incrementally adds new items to PostgreSQL database.
 """
-import argparse
-import sys
-import psycopg2
-from datetime import datetime
+
+import os
+import json
+import time
 import requests
-from typing import List, Dict, Set
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+import psycopg2
+from psycopg2.extras import execute_values
 
-# Importar desde app
-sys.path.insert(0, ".")
-from app.db import get_conn
-
-# URLs base de DSpace (ajusta según tu caso)
-DSPACE_URLS = {
-    "UNAP": "https://repositorio.unap.edu.pe/rest",
-    "UNSA": "https://repositorio.unsa.edu.pe/rest"
+# Configuration
+REPOSITORIES = {
+    "UNAP": {
+        "base_url": "http://repositorio.unap.edu.pe",
+        "api_endpoint": "/rest/items",
+        "university": "UNAP"
+    },
+    "UNSA": {
+        "base_url": "http://repositorio.unsa.edu.pe",
+        "api_endpoint": "/rest/items",
+        "university": "UNSA"
+    }
 }
 
+OUTPUT_DIR = "data"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-def get_existing_uuids(conn, university: str) -> Set[str]:
-    """Obtener UUIDs ya existentes en la base de datos."""
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT uuid FROM items WHERE university = %s",
-            (university,)
-        )
-        return {row[0] for row in cur.fetchall()}
+def get_db_connection():
+    """Get PostgreSQL connection from environment variable"""
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        raise ValueError("DATABASE_URL environment variable not set")
+    return psycopg2.connect(database_url)
 
-
-def fetch_items_from_dspace(university: str) -> List[Dict]:
+def harvest_repository(repo_name: str, config: Dict[str, str]) -> List[Dict[str, Any]]:
     """
-    Fetch items desde el API REST de DSpace.
+    Harvest items from a DSpace repository
     
-    NOTA: Esta es una implementación de ejemplo.
-    Debes adaptarla según el API real de UNAP/UNSA.
+    Args:
+        repo_name: Repository name (UNAP/UNSA)
+        config: Repository configuration
+    
+    Returns:
+        List of harvested items
     """
-    base_url = DSPACE_URLS.get(university)
-    if not base_url:
-        raise ValueError(f"Universidad no soportada: {university}")
+    print(f"\n🔍 Harvesting {repo_name}...")
     
-    # Ejemplo de endpoint (ajusta según el API real)
-    # Posibles endpoints: /items, /collections/{id}/items, etc.
-    all_items = []
+    base_url = config["base_url"]
+    api_endpoint = config["api_endpoint"]
+    university = config["university"]
     
-    try:
-        # PLACEHOLDER: Implementa la lógica real de harvesting
-        # Ejemplo con paginación:
-        offset = 0
-        limit = 100
+    items = []
+    offset = 0
+    limit = 100
+    
+    while True:
+        url = f"{base_url}{api_endpoint}?offset={offset}&limit={limit}"
         
-        while True:
-            response = requests.get(
-                f"{base_url}/items",
-                params={"offset": offset, "limit": limit},
-                timeout=30
-            )
+        try:
+            response = requests.get(url, timeout=30)
             response.raise_for_status()
+            batch = response.json()
             
-            data = response.json()
-            items = data.get("items", []) or data  # Ajustar según estructura
-            
-            if not items:
+            if not batch:
                 break
             
-            for item in items:
-                # Extraer datos relevantes
-                all_items.append({
-                    "uuid": item.get("uuid") or item.get("id"),
-                    "title": item.get("name") or item.get("title"),
-                    "abstract": item.get("metadata", {}).get("dc.description.abstract"),
-                    "url": item.get("link") or f"{base_url}/items/{item.get('uuid')}",
-                    "date": item.get("lastModified") or datetime.now().isoformat(),
-                })
+            for item in batch:
+                # Extract metadata
+                metadata = {}
+                for field in item.get("metadata", []):
+                    key = field.get("key", "")
+                    value = field.get("value", "")
+                    
+                    if key not in metadata:
+                        metadata[key] = []
+                    metadata[key].append(value)
+                
+                # Build structured item
+                structured_item = {
+                    "uuid": item.get("uuid"),
+                    "handle": item.get("handle"),
+                    "title": " ".join(metadata.get("dc.title", [])),
+                    "abstract": " ".join(metadata.get("dc.description.abstract", [])),
+                    "authors": metadata.get("dc.contributor.author", []),
+                    "subjects": metadata.get("dc.subject", []),
+                    "date": metadata.get("dc.date.issued", [None])[0],
+                    "url": f"{base_url}/handle/{item.get('handle', '')}",
+                    "university": university
+                }
+                
+                items.append(structured_item)
+            
+            print(f"  ✓ Processed {len(items)} items (offset: {offset})")
             
             offset += limit
+            time.sleep(1)  # Be nice to the server
             
-            # Evitar loops infinitos
-            if len(items) < limit:
-                break
+        except Exception as e:
+            print(f"  ⚠️ Error at offset {offset}: {e}")
+            break
     
-    except requests.RequestException as e:
-        print(f"❌ Error fetching from {university}: {e}")
-        return []
-    
-    return all_items
+    print(f"✅ {repo_name}: {len(items)} items harvested")
+    return items
 
-
-def insert_new_items(conn, university: str, items: List[Dict]) -> int:
-    """Insertar nuevos items en la base de datos."""
-    inserted = 0
-    
+def get_existing_uuids(conn) -> set:
+    """Get set of existing UUIDs from database"""
     with conn.cursor() as cur:
-        for item in items:
-            try:
-                cur.execute(
-                    """
-                    INSERT INTO items (uuid, title, abstract_norm, url, university, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (uuid) DO NOTHING
-                    """,
-                    (
-                        item["uuid"],
-                        item["title"],
-                        item["abstract"],
-                        item["url"],
-                        university,
-                        datetime.now()
-                    )
-                )
-                if cur.rowcount > 0:
-                    inserted += 1
-            except psycopg2.Error as e:
-                print(f"⚠️  Error insertando {item['uuid']}: {e}")
-                conn.rollback()
-                continue
+        cur.execute("SELECT uuid FROM items")
+        return {row[0] for row in cur.fetchall()}
+
+def insert_new_items(conn, items: List[Dict[str, Any]], existing_uuids: set) -> int:
+    """
+    Insert new items into database
+    
+    Args:
+        conn: Database connection
+        items: List of items to insert
+        existing_uuids: Set of existing UUIDs
+    
+    Returns:
+        Number of new items inserted
+    """
+    new_items = [item for item in items if item["uuid"] not in existing_uuids]
+    
+    if not new_items:
+        print("  ℹ️ No new items to insert")
+        return 0
+    
+    # Prepare data for insertion
+    values = []
+    for item in new_items:
+        # Normalize text (simple version)
+        title_norm = item["title"].lower().strip()
+        abstract_norm = item["abstract"].lower().strip()
+        
+        values.append((
+            item["uuid"],
+            item["handle"],
+            item["title"],
+            title_norm,
+            item["abstract"],
+            abstract_norm,
+            json.dumps(item["authors"]),
+            json.dumps(item["subjects"]),
+            item["date"],
+            item["url"],
+            item["university"]
+        ))
+    
+    # Insert into database
+    with conn.cursor() as cur:
+        execute_values(
+            cur,
+            """
+            INSERT INTO items (
+                uuid, handle, title, title_norm, abstract, abstract_norm,
+                authors, subjects, date_issued, url, university
+            ) VALUES %s
+            ON CONFLICT (uuid) DO NOTHING
+            """,
+            values
+        )
     
     conn.commit()
-    return inserted
-
+    print(f"  ✅ Inserted {len(new_items)} new items")
+    return len(new_items)
 
 def main():
-    parser = argparse.ArgumentParser(description="Harvest UNAP/UNSA repositories")
-    parser.add_argument(
-        "--university",
-        choices=["UNAP", "UNSA"],
-        required=True,
-        help="Universidad a procesar"
-    )
-    parser.add_argument(
-        "--check-new",
-        action="store_true",
-        help="Solo verificar nuevos items (para CI/CD)"
-    )
-    parser.add_argument(
-        "--full-sync",
-        action="store_true",
-        help="Sincronización completa (no incremental)"
-    )
+    """Main harvesting process"""
+    print("=" * 60)
+    print("🌾 HARVEST MULTI - DSpace Repository Harvester")
+    print("=" * 60)
     
-    args = parser.parse_args()
+    start_time = time.time()
     
-    print(f"🔍 Harvesting {args.university}...")
+    # Connect to database
+    conn = get_db_connection()
+    existing_uuids = get_existing_uuids(conn)
+    print(f"📊 Existing items in DB: {len(existing_uuids)}")
     
-    # Conectar a la base de datos
-    conn = get_conn()
+    # Harvest each repository
+    all_items = []
+    total_new = 0
     
-    try:
-        # Obtener items existentes
-        existing = get_existing_uuids(conn, args.university)
-        print(f"📊 Items existentes: {len(existing)}")
+    for repo_name, config in REPOSITORIES.items():
+        items = harvest_repository(repo_name, config)
+        all_items.extend(items)
         
-        # Fetch items desde DSpace
-        all_items = fetch_items_from_dspace(args.university)
-        print(f"📥 Items obtenidos del repositorio: {len(all_items)}")
-        
-        # Filtrar nuevos items
-        new_items = [
-            item for item in all_items
-            if item["uuid"] not in existing
-        ]
-        print(f"✨ Nuevos items encontrados: {len(new_items)}")
-        
-        # Si solo queremos verificar (para CI/CD)
-        if args.check_new:
-            # Escribir count para GitHub Actions
-            with open("/tmp/new_items_count.txt", "w") as f:
-                f.write(str(len(new_items)))
-            
-            if len(new_items) == 0:
-                print("✅ No hay nuevos items")
-                return 0
-            else:
-                print(f"🆕 Se encontraron {len(new_items)} nuevos items")
-                # Mostrar primeros 5 títulos
-                for item in new_items[:5]:
-                    print(f"  - {item['title'][:80]}")
-                return 0
-        
-        # Insertar nuevos items
-        if new_items:
-            inserted = insert_new_items(conn, args.university, new_items)
-            print(f"✅ Insertados {inserted} nuevos items")
-        else:
-            print("ℹ️  No hay nuevos items para insertar")
+        new_count = insert_new_items(conn, items, existing_uuids)
+        total_new += new_count
+        existing_uuids.update(item["uuid"] for item in items)
     
-    finally:
-        conn.close()
+    conn.close()
     
-    return 0
-
+    # Save summary
+    elapsed_time = time.time() - start_time
+    summary = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "elapsed_seconds": round(elapsed_time, 2),
+        "total_harvested": len(all_items),
+        "new_items": total_new,
+        "repositories": {
+            repo: len([i for i in all_items if i["university"] == config["university"]])
+            for repo, config in REPOSITORIES.items()
+        }
+    }
+    
+    summary_path = os.path.join(OUTPUT_DIR, "harvest_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    
+    print("\n" + "=" * 60)
+    print("✅ HARVEST COMPLETED")
+    print("=" * 60)
+    print(f"📊 Total harvested: {len(all_items)}")
+    print(f"🆕 New items: {total_new}")
+    print(f"⏱️  Time: {elapsed_time:.2f}s")
+    print(f"💾 Summary: {summary_path}")
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

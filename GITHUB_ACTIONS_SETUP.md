@@ -1,76 +1,95 @@
-# GitHub Actions - Configuración de Secrets
+# GitHub Actions Setup - Automated Repository Updates
 
-Para que el workflow funcione, necesitas configurar estos secrets en tu repositorio de GitHub:
+Este documento explica cómo configurar GitHub Actions para actualizar automáticamente los repositorios UNAP/UNSA.
 
-## 📋 Secrets Requeridos
+## 🎯 Funcionalidad
+
+El workflow automático ejecuta:
+
+1. **Harvest** - Busca nuevos repositorios en UNAP/UNSA
+2. **Semantic Indexing** - Actualiza el índice FAISS
+3. **Topic Clustering** - Agrupa documentos por temas
+4. **Deploy** - Push automático a GitHub y Hugging Face Spaces
+
+## ⚙️ Configuración
+
+### 1. Secretos de GitHub
 
 Ve a: `Settings` → `Secrets and variables` → `Actions` → `New repository secret`
 
-### 1. DATABASE_URL
-- **Descripción**: URL de conexión a PostgreSQL en Render
-- **Formato**: `postgresql://user:password@host:5432/database`
-- **Obtener de**: Render Dashboard → tu servicio PostgreSQL → "Internal Database URL"
+Crea estos secretos:
 
-### 2. HF_TOKEN
-- **Descripción**: Token de autenticación de Hugging Face
-- **Obtener de**: https://huggingface.co/settings/tokens
-- **Permisos necesarios**: `write` (para poder hacer push y restart)
-- **Formato**: `hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxx`
+- **`DATABASE_URL`**: URL de conexión PostgreSQL
+  ```
+  postgresql://usuario:password@host:puerto/database
+  ```
 
-## 🔧 Configuración Adicional
+- **`HF_TOKEN`**: Token de Hugging Face
+  - Ve a: https://huggingface.co/settings/tokens
+  - Crea un token con permisos de `write`
 
-### Ajustar el Schedule
+### 2. Estructura de Base de Datos
 
-En el archivo `.github/workflows/update_repositories.yml`, puedes modificar el cron:
+El workflow requiere estas tablas en PostgreSQL:
 
-```yaml
-schedule:
-  - cron: '0 2 * * 0'  # Semanal: Domingos a las 2 AM UTC
-  # - cron: '0 2 1 * *'  # Mensual: Día 1 de cada mes a las 2 AM UTC
-  # - cron: '0 */6 * * *'  # Cada 6 horas
+```sql
+-- Tabla principal de items
+CREATE TABLE items (
+    uuid VARCHAR(255) PRIMARY KEY,
+    handle VARCHAR(255),
+    title TEXT,
+    title_norm TEXT,
+    abstract TEXT,
+    abstract_norm TEXT,
+    authors JSONB,
+    subjects JSONB,
+    date_issued VARCHAR(50),
+    url TEXT,
+    university VARCHAR(50),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Tabla de clusters
+CREATE TABLE clusters (
+    uuid VARCHAR(255),
+    model_name VARCHAR(100),
+    cluster_id INTEGER,
+    PRIMARY KEY (uuid, model_name),
+    FOREIGN KEY (uuid) REFERENCES items(uuid) ON DELETE CASCADE
+);
+
+-- Tabla de etiquetas de clusters
+CREATE TABLE cluster_labels (
+    model_name VARCHAR(100),
+    cluster_id INTEGER,
+    label TEXT,
+    PRIMARY KEY (model_name, cluster_id)
+);
+
+-- Índices para mejor rendimiento
+CREATE INDEX idx_items_university ON items(university);
+CREATE INDEX idx_items_date ON items(date_issued);
+CREATE INDEX idx_clusters_model ON clusters(model_name);
 ```
 
-**Sintaxis cron**: `minuto hora día_mes mes día_semana`
-- Ejemplo: `0 2 * * 0` = Minuto 0, Hora 2, Todos los días del mes, Todos los meses, Domingo
+### 3. Dependencias Python
 
-### Ejecutar Manualmente
+El archivo `requirements.txt` debe incluir:
 
-El workflow incluye `workflow_dispatch`, lo que permite ejecutarlo manualmente:
-1. Ve a: `Actions` → `Update UNAP/UNSA Repositories`
-2. Click en "Run workflow"
-3. Selecciona la rama `main`
-4. Click en "Run workflow" verde
+```txt
+# Ya existentes
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+psycopg2-binary==2.9.9
+sentence-transformers==2.2.2
+huggingface-hub==0.16.4
+numpy==1.24.3
+faiss-cpu==1.7.4
+scikit-learn==1.3.2
+pandas==2.1.3
+pydantic==2.5.0
+python-dotenv==1.0.0
+requests==2.31.0
 
-## 📝 Notas Importantes
-
-1. **Git LFS**: El workflow maneja automáticamente Git LFS para el archivo `faiss.index`
-2. **Incremental**: Los scripts deben soportar el flag `--incremental` para solo procesar nuevos items
-3. **Error Handling**: Si falla, revisa los logs en la pestaña "Actions" de GitHub
-4. **Costos**: GitHub Actions es gratis para repos públicos (2000 minutos/mes en privados)
-
-## 🧪 Probar Localmente
-
-Antes de hacer push, prueba el workflow localmente:
-
-```bash
-# Simular el proceso
-export DATABASE_URL="postgresql://..."
-python scripts/01.harvest_multi.py --university UNAP --check-new
-python scripts/02.semantic_indexer.py --incremental
-python scripts/03.build_topics_hdbscan.py --incremental
-```
-
-## ✅ Verificación Post-Deploy
-
-Después de que el workflow se ejecute:
-
-1. Verifica el commit en GitHub (debe tener el mensaje "chore: update repositories index")
-2. Verifica que HF Spaces se reinició
-3. Prueba el endpoint: `https://tamoil13-unap-research-ml.hf.space/health`
-4. Revisa `index_count` en el health endpoint
-
-## 🔔 Monitoreo
-
-GitHub te enviará un email si el workflow falla. También puedes:
-- Ver el historial en: `Actions` → `Update UNAP/UNSA Repositories`
-- Ver el summary con estadísticas de cada ejecución
+# Nuevas para clustering
+hdbscan==0.8.33
