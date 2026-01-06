@@ -53,6 +53,21 @@ def startup():
     import threading
     threading.Thread(target=rec.load, daemon=True).start()
 
+@app.get("/")
+def root():
+    return {
+        "service": "UNAP Recommender API",
+        "status": "running",
+        "model": rec.model_name,
+        "device": rec.device,
+        "endpoints": {
+            "health": "/health",
+            "recommend": "/recommend",
+            "item": "/items/{uuid}",
+            "topics_top": "/topics/top",
+            "topics_cluster": "/topics/{cluster_id}"
+        }
+    }
 
 @app.get("/health")
 def health():
