@@ -1,8 +1,3 @@
-{
-  "model": "BAAI/bge-m3",
-  "count": 36756,
-  "dim": 1024,
-  "type": "dense_bge_m3",
-  "device": "cuda",
-  "max_seq_length": 2048
-}
+version https://git-lfs.github.com/spec/v1
+oid sha256:8bd0bcec8b253e2b964f252f97017b12af5679f7e06ed74e4301cc7bbd281270
+size 140
