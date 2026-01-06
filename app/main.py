@@ -19,6 +19,16 @@ app.add_middleware(
 )
 
 rec = Recommender()
+@app.get("/")
+def root():
+    return {
+        "service": "UNAP Recommender API",
+        "status": "running",
+        "model": rec.model_name,
+        "device": rec.device,
+        "docs": "/docs",
+        "health": "/health"
+    }
 
 
 class RecommendRequest(BaseModel):
