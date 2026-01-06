@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Database
+*.db
+pgdata/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+# Chrome extension assets (not needed for HF Spaces)
+extension/icons/
+extension/*.png
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

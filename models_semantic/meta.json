@@ -1,0 +1,8 @@
+{
+  "model": "BAAI/bge-m3",
+  "count": 36756,
+  "dim": 1024,
+  "type": "dense_bge_m3",
+  "device": "cuda",
+  "max_seq_length": 2048
+}
