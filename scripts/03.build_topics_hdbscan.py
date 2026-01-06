@@ -3,15 +3,28 @@
 03. Build Topics HDBSCAN - Topic Clustering
 Clusters documents into topics using HDBSCAN on FAISS embeddings.
 Updates PostgreSQL with cluster assignments.
+
+NOTE: This script requires hdbscan which is NOT in requirements.txt
+because it can't compile on Hugging Face Spaces. Only run locally.
 """
 
 import os
 import json
 import time
+import sys
+
+# Check if hdbscan is available
+try:
+    import hdbscan
+    HDBSCAN_AVAILABLE = True
+except ImportError:
+    print("⚠️ WARNING: hdbscan not installed. Clustering skipped.")
+    print("   Install locally with: pip install hdbscan==0.8.38")
+    HDBSCAN_AVAILABLE = False
+
 import numpy as np
 import faiss
 from typing import Dict, List, Tuple
-import hdbscan
 from sklearn.feature_extraction.text import TfidfVectorizer
 import psycopg2
 from psycopg2.extras import execute_values
@@ -218,6 +231,13 @@ def main():
     print("=" * 60)
     print("📊 BUILD TOPICS HDBSCAN - Topic Clustering")
     print("=" * 60)
+    
+    # Check if hdbscan is available
+    if not HDBSCAN_AVAILABLE:
+        print("\n❌ ERROR: hdbscan not installed")
+        print("   This script is skipped in production (HF Spaces)")
+        print("   To run locally: pip install hdbscan==0.8.38")
+        sys.exit(0)  # Exit gracefully, not an error
     
     start_time = time.time()
     

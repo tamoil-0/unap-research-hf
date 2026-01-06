@@ -68,12 +68,13 @@ jobs:
           python scripts/02.semantic_indexer.py
           echo "✅ FAISS index updated"
       
-      - name: Cluster topics (HDBSCAN)
-        if: steps.harvest.outputs.new_items > 0 || github.event.inputs.force_full_reindex == 'true'
-        run: |
-          echo "📊 Clustering topics with HDBSCAN..."
-          python scripts/03.build_topics_hdbscan.py
-          echo "✅ Topics clustered"
+      # HDBSCAN clustering deshabilitado (no compatible con HF Spaces)
+      # - name: Cluster topics (HDBSCAN)
+      #   if: steps.harvest.outputs.new_items > 0 || github.event.inputs.force_full_reindex == 'true'
+      #   run: |
+      #     echo "📊 Clustering topics with HDBSCAN..."
+      #     python scripts/03.build_topics_hdbscan.py
+      #     echo "✅ Topics clustered"
       
       - name: Commit and push changes
         if: steps.harvest.outputs.new_items > 0 || github.event.inputs.force_full_reindex == 'true'
