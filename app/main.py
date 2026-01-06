@@ -81,7 +81,21 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "model": rec.model_name, "device": rec.device}
+    index_loaded = rec.index is not None
+    index_count = rec.uuid_list.__len__() if rec.uuid_list else 0
+    
+    response = {
+        "ok": True,
+        "model": rec.model_name,
+        "device": rec.device,
+        "index_loaded": index_loaded,
+        "index_count": index_count
+    }
+    
+    if not index_loaded:
+        response["warning"] = "FAISS index not loaded yet. Check logs or retry in a few seconds."
+    
+    return response
 
 
 def fetch_items_by_uuids(uuids: List[str], model_name: str, include_abstract: bool):
