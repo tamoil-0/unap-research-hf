@@ -22,6 +22,19 @@ COPY app/ ./app/
 
 COPY models_semantic/ ./models_semantic/
 
+# Verificar que los archivos LFS se descargaron correctamente
+RUN if [ ! -f models_semantic/faiss.index ]; then \
+        echo "ERROR: faiss.index not found!"; \
+        exit 1; \
+    fi && \
+    FILE_SIZE=$(stat -f%z models_semantic/faiss.index 2>/dev/null || stat -c%s models_semantic/faiss.index) && \
+    echo "faiss.index size: $FILE_SIZE bytes" && \
+    if [ "$FILE_SIZE" -lt 1000 ]; then \
+        echo "ERROR: faiss.index is too small (probably a Git LFS pointer)"; \
+        cat models_semantic/faiss.index; \
+        exit 1; \
+    fi
+
 EXPOSE 7860
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7860"]

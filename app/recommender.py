@@ -92,10 +92,21 @@ class Recommender:
         index_path = os.path.join(MODEL_DIR, "faiss.index")
         map_path = os.path.join(MODEL_DIR, "uuid_map.json")
 
+        # Verificar existencia y tamaño
         if not os.path.exists(index_path):
             raise RuntimeError(f"FAISS index not found: {index_path}")
         if not os.path.exists(map_path):
             raise RuntimeError(f"uuid_map.json not found: {map_path}")
+        
+        # Verificar que no sea un puntero LFS
+        index_size = os.path.getsize(index_path)
+        if index_size < 1000:  # Si es muy pequeño, probablemente es un puntero LFS
+            with open(index_path, 'r') as f:
+                content = f.read()
+                if 'version https://git-lfs.github.com' in content:
+                    raise RuntimeError(f"FAISS index is a Git LFS pointer, not the actual file. Size: {index_size} bytes. HF Spaces needs to pull LFS files.")
+        
+        print(f"  📊 Loading FAISS index ({index_size / 1024 / 1024:.1f} MB)...")
 
         index = faiss.read_index(index_path)
 
