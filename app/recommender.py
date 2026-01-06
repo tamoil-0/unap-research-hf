@@ -9,7 +9,7 @@ import faiss
 import torch
 from sentence_transformers import SentenceTransformer
 
-# Evita locks y warnings en HF
+# Evita warnings y locks en HF
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # =========================
@@ -18,7 +18,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 MODEL_DIR = os.getenv("MODEL_DIR", "models_semantic")
 DEFAULT_MODEL_NAME = os.getenv("MODEL_NAME", "BAAI/bge-m3")
-MODEL_NAME = DEFAULT_MODEL_NAME
 
 
 # =========================
@@ -79,11 +78,11 @@ class Recommender:
         self._lock = threading.RLock()
 
         self.model_name = load_meta_model_name(MODEL_DIR) or DEFAULT_MODEL_NAME
-
-        global MODEL_NAME
-        MODEL_NAME = self.model_name
-
         self.use_faiss_gpu = os.getenv("USE_FAISS_GPU", "0").strip() == "1"
+
+        # Estado
+        self.ready: bool = False
+        self.load_error: Optional[str] = None
 
     # =========================
     # LOAD FAISS (HF SAFE)
@@ -93,13 +92,13 @@ class Recommender:
         index_path = os.path.join(MODEL_DIR, "faiss.index")
         map_path = os.path.join(MODEL_DIR, "uuid_map.json")
 
-        if not os.path.exists(index_path) or not os.path.exists(map_path):
-            raise RuntimeError(
-                "FAISS index not found. "
-                "Build it locally and upload models_semantic/ to Hugging Face."
-            )
+        if not os.path.exists(index_path):
+            raise RuntimeError(f"FAISS index not found: {index_path}")
+        if not os.path.exists(map_path):
+            raise RuntimeError(f"uuid_map.json not found: {map_path}")
 
         index = faiss.read_index(index_path)
+
         with open(map_path, "r", encoding="utf-8") as f:
             uuid_map = json.load(f)
 
@@ -121,30 +120,46 @@ class Recommender:
             return index
 
     # =========================
-    # LOAD ALL
+    # LOAD ALL (SAFE)
     # =========================
 
     def load(self):
         with self._lock:
-            # evita doble carga
-            if self.model is not None and self.index is not None:
+            if self.ready:
                 return
 
-            index, uuid_map = self._load_index_and_map_cpu()
+            try:
+                # 1. Cargar FAISS
+                index, uuid_map = self._load_index_and_map_cpu()
 
-            model = SentenceTransformer(self.model_name, device=self.device)
+                # 2. Cargar modelo de embeddings
+                model = SentenceTransformer(self.model_name, device=self.device)
 
-            if self.device == "cuda":
-                try:
-                    model.half()
-                except Exception:
-                    pass
+                if self.device == "cuda":
+                    try:
+                        model.half()
+                    except Exception:
+                        pass
 
-            index = self._maybe_to_gpu(index)
+                # 3. FAISS a GPU (opcional)
+                index = self._maybe_to_gpu(index)
 
-            self.index = index
-            self.uuid_map = uuid_map
-            self.model = model
+                # 4. Asignar estado
+                self.index = index
+                self.uuid_map = uuid_map
+                self.model = model
+                self.ready = True
+                self.load_error = None
+
+                print("✅ Recommender READY")
+                print(f"   - Model: {self.model_name}")
+                print(f"   - Device: {self.device}")
+                print(f"   - Vectors: {len(self.uuid_map)}")
+
+            except Exception as e:
+                self.ready = False
+                self.load_error = str(e)
+                print("❌ Recommender load failed:", e)
 
     # =========================
     # HOT RELOAD (OPTIONAL)
@@ -163,7 +178,7 @@ class Recommender:
 
     def _encode_query(self, query: str) -> np.ndarray:
         if not self.model:
-            raise RuntimeError("Modelo no cargado. Llama rec.load() primero.")
+            raise RuntimeError("Modelo no cargado")
 
         q = (query or "").strip()
         if not q:
@@ -181,8 +196,8 @@ class Recommender:
 
     def search(self, query: str, k: int = 10) -> List[Tuple[str, float]]:
         with self._lock:
-            if self.index is None or self.uuid_map is None:
-                raise RuntimeError("Index no cargado. Llama rec.load() primero.")
+            if not self.ready:
+                raise RuntimeError(f"Recommender not ready: {self.load_error}")
 
             qvec = self._encode_query(query)
 

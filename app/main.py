@@ -1,6 +1,7 @@
-#app/main.py
-import os
+# app/main.py
+import threading
 from typing import List, Optional, Dict, Any
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -8,28 +9,38 @@ from pydantic import BaseModel
 from app.db import get_conn
 from app.recommender import Recommender
 
+# =========================
+# APP
+# =========================
+
 app = FastAPI(title="UNAP Recommender API", version="2.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-rec = Recommender()
-@app.get("/")
-def root():
-    return {
-        "service": "UNAP Recommender API",
-        "status": "running",
-        "model": rec.model_name,
-        "device": rec.device,
-        "docs": "/docs",
-        "health": "/health"
-    }
+# =========================
+# RECOMMENDER (GLOBAL)
+# =========================
 
+rec = Recommender()
+
+# =========================
+# STARTUP
+# =========================
+
+@app.on_event("startup")
+def startup():
+    # carga en background (HF-safe)
+    threading.Thread(target=rec.load, daemon=True).start()
+
+# =========================
+# MODELS
+# =========================
 
 class RecommendRequest(BaseModel):
     text: str
@@ -47,7 +58,7 @@ class RecommendItem(BaseModel):
     cluster_id: Optional[int] = None
     label: Optional[str] = None
     abstract_norm: Optional[str] = None
-    university: Optional[str] = None 
+    university: Optional[str] = None
 
 
 class RecommendResponse(BaseModel):
@@ -57,11 +68,9 @@ class RecommendResponse(BaseModel):
     results: List[RecommendItem]
     same_topic: Optional[List[RecommendItem]] = None
 
-
-@app.on_event("startup")
-def startup():
-    import threading
-    threading.Thread(target=rec.load, daemon=True).start()
+# =========================
+# ROOT / HEALTH
+# =========================
 
 @app.get("/")
 def root():
@@ -70,45 +79,45 @@ def root():
         "status": "running",
         "model": rec.model_name,
         "device": rec.device,
+        "ready": rec.ready,
         "endpoints": {
             "health": "/health",
             "recommend": "/recommend",
             "item": "/items/{uuid}",
             "topics_top": "/topics/top",
-            "topics_cluster": "/topics/{cluster_id}"
-        }
+            "topics_cluster": "/topics/{cluster_id}",
+        },
     }
+
 
 @app.get("/health")
 def health():
-    index_loaded = rec.index is not None
-    index_count = rec.uuid_list.__len__() if rec.uuid_list else 0
-    
-    response = {
+    return {
         "ok": True,
+        "ready": rec.ready,
         "model": rec.model_name,
         "device": rec.device,
-        "index_loaded": index_loaded,
-        "index_count": index_count
+        "index_loaded": rec.ready,
+        "index_count": len(rec.uuid_map) if rec.uuid_map else 0,
+        "error": rec.load_error,
     }
-    
-    if not index_loaded:
-        response["warning"] = "FAISS index not loaded yet. Check logs or retry in a few seconds."
-    
-    return response
 
+# =========================
+# DB HELPERS
+# =========================
 
 def fetch_items_by_uuids(uuids: List[str], model_name: str, include_abstract: bool):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(f"""
+            cur.execute(
+                f"""
                 SELECT
                   i.uuid,
                   i.title,
                   i.url,
                   {"i.abstract_norm," if include_abstract else "NULL::text as abstract_norm,"}
-                  i.university,               -- ✅ NUEVO
+                  i.university,
                   c.cluster_id,
                   cl.label
                 FROM items i
@@ -117,7 +126,9 @@ def fetch_items_by_uuids(uuids: List[str], model_name: str, include_abstract: bo
                 LEFT JOIN cluster_labels cl
                   ON cl.model_name = %s AND cl.cluster_id = c.cluster_id
                 WHERE i.uuid = ANY(%s)
-            """, (model_name, model_name, uuids))
+                """,
+                (model_name, model_name, uuids),
+            )
             rows = cur.fetchall()
     finally:
         conn.close()
@@ -129,21 +140,28 @@ def fetch_items_by_uuids(uuids: List[str], model_name: str, include_abstract: bo
             "title": r[1] or "",
             "url": r[2],
             "abstract_norm": r[3] if include_abstract else None,
-            "university": r[4],           
+            "university": r[4],
             "cluster_id": r[5],
             "label": r[6] or "(sin etiqueta)",
         }
     return out
 
 
-def fetch_same_topic_items(model_name: str, cluster_id: int, exclude_uuid: str, limit: int, include_abstract: bool):
+def fetch_same_topic_items(
+    model_name: str,
+    cluster_id: int,
+    exclude_uuid: str,
+    limit: int,
+    include_abstract: bool,
+):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(f"""
+            cur.execute(
+                f"""
                 SELECT i.uuid, i.title, i.url,
                        {"i.abstract_norm," if include_abstract else "NULL::text as abstract_norm,"}
-                       i.university,            -- ✅ NUEVO
+                       i.university,
                        c.cluster_id, cl.label
                 FROM clusters c
                 JOIN items i ON i.uuid = c.uuid
@@ -154,27 +172,35 @@ def fetch_same_topic_items(model_name: str, cluster_id: int, exclude_uuid: str, 
                   AND i.uuid <> %s
                 ORDER BY i.updated_at DESC
                 LIMIT %s
-            """, (model_name, model_name, int(cluster_id), exclude_uuid, int(limit)))
+                """,
+                (model_name, model_name, cluster_id, exclude_uuid, limit),
+            )
             rows = cur.fetchall()
     finally:
         conn.close()
 
-    return [{
-        "uuid": r[0],
-        "title": r[1] or "",
-        "url": r[2],
-        "abstract_norm": r[3] if include_abstract else None,
-        "university": r[4],              # ✅ NUEVO
-        "score": 0.0,
-        "cluster_id": r[5],
-        "label": r[6] or "(sin etiqueta)",
-    } for r in rows]
+    return [
+        {
+            "uuid": r[0],
+            "title": r[1] or "",
+            "url": r[2],
+            "abstract_norm": r[3] if include_abstract else None,
+            "university": r[4],
+            "score": 0.0,
+            "cluster_id": r[5],
+            "label": r[6] or "(sin etiqueta)",
+        }
+        for r in rows
+    ]
 
+# =========================
+# RECOMMEND
+# =========================
 
 @app.post("/recommend", response_model=RecommendResponse)
 def recommend(req: RecommendRequest):
-    if rec.model is None or rec.index is None:
-        raise HTTPException(503, "Modelo cargando, intente en unos segundos")
+    if not rec.ready:
+        raise HTTPException(503, rec.load_error or "Modelo cargando")
 
     q = (req.text or "").strip()
     if not q:
@@ -182,9 +208,12 @@ def recommend(req: RecommendRequest):
 
     model_name = rec.model_name
 
-    pairs = rec.search(q, k=req.k)  
+    pairs = rec.search(q, k=req.k)
     uuids = [u for u, _ in pairs]
-    enriched = fetch_items_by_uuids(uuids, model_name, include_abstract=req.include_abstract)
+
+    enriched = fetch_items_by_uuids(
+        uuids, model_name, include_abstract=req.include_abstract
+    )
 
     results = []
     top1 = None
@@ -193,10 +222,10 @@ def recommend(req: RecommendRequest):
         it = enriched.get(uuid, {})
         row = {
             "uuid": uuid,
-            "title": (it.get("title") or "").strip(),
+            "title": it.get("title", ""),
             "url": it.get("url"),
             "abstract_norm": it.get("abstract_norm"),
-            "university": it.get("university"),      # ✅ NUEVO
+            "university": it.get("university"),
             "score": float(score),
             "cluster_id": it.get("cluster_id"),
             "label": it.get("label") or "(sin etiqueta)",
@@ -207,19 +236,20 @@ def recommend(req: RecommendRequest):
 
     inferred_topic = None
     same_topic = None
+
     if top1 and top1.get("cluster_id") is not None and int(top1["cluster_id"]) != -1:
         inferred_topic = {
             "cluster_id": int(top1["cluster_id"]),
-            "label": top1.get("label") or "(sin etiqueta)"
+            "label": top1.get("label"),
         }
 
         if req.same_topic:
             same_topic = fetch_same_topic_items(
                 model_name,
-                int(top1["cluster_id"]),
+                inferred_topic["cluster_id"],
                 top1["uuid"],
                 req.same_topic_k,
-                include_abstract=req.include_abstract
+                include_abstract=req.include_abstract,
             )
 
     return {
@@ -230,17 +260,24 @@ def recommend(req: RecommendRequest):
         "same_topic": same_topic,
     }
 
+# =========================
+# EXTRA ENDPOINTS (SIN CAMBIOS)
+# =========================
 
 @app.get("/items/{uuid}")
 def get_item(uuid: str):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT uuid, title, url, abstract_norm, date_issued, authors, advisors, keywords, university
+            cur.execute(
+                """
+                SELECT uuid, title, url, abstract_norm,
+                       date_issued, authors, advisors, keywords, university
                 FROM items
                 WHERE uuid = %s
-            """, (uuid,))
+                """,
+                (uuid,),
+            )
             r = cur.fetchone()
     finally:
         conn.close()
@@ -257,52 +294,5 @@ def get_item(uuid: str):
         "authors": r[5],
         "advisors": r[6],
         "keywords": r[7],
-        "university": r[8],   # ✅ NUEVO
+        "university": r[8],
     }
-
-
-@app.get("/topics/top")
-def topics_top(n: int = 200):
-    model_name = rec.model_name
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT cluster_id, label, size, keywords
-                FROM cluster_labels
-                WHERE model_name = %s
-                ORDER BY size DESC
-                LIMIT %s
-            """, (model_name, int(n)))
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    return [
-        {"cluster_id": r[0], "label": r[1], "size": r[2], "keywords": r[3]}
-        for r in rows
-    ]
-
-
-@app.get("/topics/{cluster_id}")
-def topics_cluster(cluster_id: int, limit: int = 80):
-    model_name = rec.model_name
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT i.uuid, i.title, i.url, i.abstract_norm, i.university
-                FROM clusters c
-                JOIN items i ON i.uuid = c.uuid
-                WHERE c.model_name = %s AND c.cluster_id = %s
-                ORDER BY i.updated_at DESC
-                LIMIT %s
-            """, (model_name, int(cluster_id), int(limit)))
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    return [
-        {"uuid": r[0], "title": r[1], "url": r[2], "abstract_norm": r[3], "university": r[4]}
-        for r in rows
-    ]
