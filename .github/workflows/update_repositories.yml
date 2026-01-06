@@ -1,0 +1,145 @@
+name: Update UNAP/UNSA Repositories
+
+on:
+  # Ejecutar cada domingo a las 2 AM (ajusta según tu zona horaria)
+  schedule:
+    - cron: '0 2 * * 0'  # Semanal
+    # - cron: '0 2 1 * *'  # Mensual (día 1 de cada mes)
+  
+  # Permitir ejecución manual desde GitHub UI
+  workflow_dispatch:
+
+env:
+  DATABASE_URL: ${{ secrets.DATABASE_URL }}
+  PYTHON_VERSION: '3.10'
+
+jobs:
+  update-repositories:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true  # Para manejar archivos LFS (FAISS index)
+      
+      - name: Configure Git LFS
+        run: |
+          git lfs install
+          git lfs pull
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Check for new repositories (UNAP)
+        id: harvest_unap
+        run: |
+          echo "🔍 Buscando nuevos repositorios en UNAP..."
+          python scripts/01.harvest_multi.py --university UNAP --check-new
+          echo "new_items_unap=$(cat /tmp/new_items_count.txt 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+        continue-on-error: false
+      
+      - name: Check for new repositories (UNSA)
+        id: harvest_unsa
+        run: |
+          echo "🔍 Buscando nuevos repositorios en UNSA..."
+          python scripts/01.harvest_multi.py --university UNSA --check-new
+          echo "new_items_unsa=$(cat /tmp/new_items_count.txt 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+        continue-on-error: false
+      
+      - name: Process new items
+        if: steps.harvest_unap.outputs.new_items_unap > 0 || steps.harvest_unsa.outputs.new_items_unsa > 0
+        run: |
+          echo "📦 Nuevos items encontrados:"
+          echo "  - UNAP: ${{ steps.harvest_unap.outputs.new_items_unap }}"
+          echo "  - UNSA: ${{ steps.harvest_unsa.outputs.new_items_unsa }}"
+          
+          echo "🔄 Actualizando índice semántico..."
+          python scripts/02.semantic_indexer.py --incremental
+          
+          echo "🏷️ Actualizando clusters..."
+          python scripts/03.build_topics_hdbscan.py --incremental
+      
+      - name: Verify FAISS index
+        if: steps.harvest_unap.outputs.new_items_unap > 0 || steps.harvest_unsa.outputs.new_items_unsa > 0
+        run: |
+          python -c "
+          import faiss
+          import json
+          
+          index = faiss.read_index('models_semantic/faiss.index')
+          with open('models_semantic/uuid_map.json') as f:
+              uuid_map = json.load(f)
+          
+          print(f'✅ Índice FAISS actualizado: {index.ntotal} vectores')
+          print(f'✅ UUID map: {len(uuid_map)} entradas')
+          "
+      
+      - name: Commit and push changes
+        if: steps.harvest_unap.outputs.new_items_unap > 0 || steps.harvest_unsa.outputs.new_items_unsa > 0
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Track archivos LFS
+          git lfs track "models_semantic/faiss.index"
+          git lfs track "models_semantic/uuid_map.json"
+          
+          git add models_semantic/
+          git add .gitattributes
+          
+          # Crear commit con información de actualización
+          TOTAL_NEW=$((${steps.harvest_unap.outputs.new_items_unap} + ${steps.harvest_unsa.outputs.new_items_unsa}))
+          git commit -m "chore: update repositories index (+$TOTAL_NEW items)" \
+                     -m "UNAP: +${{ steps.harvest_unap.outputs.new_items_unap }}" \
+                     -m "UNSA: +${{ steps.harvest_unsa.outputs.new_items_unsa }}" \
+                     -m "Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" || echo "No hay cambios"
+          
+          git push origin main
+      
+      - name: Push to Hugging Face Spaces
+        if: steps.harvest_unap.outputs.new_items_unap > 0 || steps.harvest_unsa.outputs.new_items_unsa > 0
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git remote add hf https://huggingface.co/spaces/tamoil13/unap-research-ml || true
+          git push hf main --force
+      
+      - name: Trigger HF Spaces rebuild
+        if: steps.harvest_unap.outputs.new_items_unap > 0 || steps.harvest_unsa.outputs.new_items_unsa > 0
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          curl -X POST \
+            "https://huggingface.co/api/spaces/tamoil13/unap-research-ml/restart" \
+            -H "Authorization: Bearer $HF_TOKEN"
+      
+      - name: Create summary
+        if: always()
+        run: |
+          echo "## 📊 Resumen de Actualización" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 🎓 **UNAP**: ${{ steps.harvest_unap.outputs.new_items_unap }} nuevos repositorios" >> $GITHUB_STEP_SUMMARY
+          echo "- 🎓 **UNSA**: ${{ steps.harvest_unsa.outputs.new_items_unsa }} nuevos repositorios" >> $GITHUB_STEP_SUMMARY
+          echo "- 📅 **Fecha**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.harvest_unap.outputs.new_items_unap }}" -gt 0 ] || [ "${{ steps.harvest_unsa.outputs.new_items_unsa }}" -gt 0 ]; then
+            echo "✅ Índice actualizado y desplegado en HF Spaces" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "ℹ️ No se encontraron nuevos repositorios" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ Error en la actualización automática" >> $GITHUB_STEP_SUMMARY
+          echo "Revisa los logs para más detalles" >> $GITHUB_STEP_SUMMARY
