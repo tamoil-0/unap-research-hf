@@ -17,15 +17,20 @@ from psycopg2.extras import execute_values
 # Configuration
 REPOSITORIES = {
     "UNAP": {
-        "base_url": "http://repositorio.unap.edu.pe",
-        "api_endpoint": "/rest/items",
+        "url": "https://repositorio.unap.edu.pe/server/api/discover/search/objects",
+        "base_url": "https://repositorio.unap.edu.pe",
         "university": "UNAP"
     },
     "UNSA": {
-        "base_url": "http://repositorio.unsa.edu.pe",
-        "api_endpoint": "/rest/items",
+        "url": "https://repositorio.unsa.edu.pe/server/api/discover/search/objects",
+        "base_url": "https://repositorio.unsa.edu.pe",
         "university": "UNSA"
     }
+}
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; ResearchHarvester/1.0)",
+    "Accept": "application/json",
 }
 
 OUTPUT_DIR = "data"
@@ -40,7 +45,7 @@ def get_db_connection():
 
 def harvest_repository(repo_name: str, config: Dict[str, str]) -> List[Dict[str, Any]]:
     """
-    Harvest items from a DSpace repository
+    Harvest items from a DSpace 7+ repository
     
     Args:
         repo_name: Repository name (UNAP/UNSA)
@@ -51,58 +56,78 @@ def harvest_repository(repo_name: str, config: Dict[str, str]) -> List[Dict[str,
     """
     print(f"\n🔍 Harvesting {repo_name}...")
     
+    api_url = config["url"]
     base_url = config["base_url"]
-    api_endpoint = config["api_endpoint"]
     university = config["university"]
     
     items = []
-    offset = 0
-    limit = 100
+    page = 0
+    size = 100
     
     while True:
-        url = f"{base_url}{api_endpoint}?offset={offset}&limit={limit}"
+        params = {
+            "page": page,
+            "size": size,
+            "sort": "dc.date.accessioned,DESC"
+        }
         
         try:
-            response = requests.get(url, timeout=30)
+            response = requests.get(api_url, params=params, headers=HEADERS, timeout=30)
             response.raise_for_status()
-            batch = response.json()
+            data = response.json()
             
-            if not batch:
+            # DSpace 7+ structure: data._embedded.searchResult._embedded.objects
+            search_result = data.get("_embedded", {}).get("searchResult", {})
+            objects = search_result.get("_embedded", {}).get("objects", [])
+            
+            if not objects:
                 break
             
-            for item in batch:
+            for obj in objects:
+                item_data = obj.get("_embedded", {}).get("indexableObject", {})
+                
                 # Extract metadata
-                metadata = {}
-                for field in item.get("metadata", []):
-                    key = field.get("key", "")
-                    value = field.get("value", "")
-                    
-                    if key not in metadata:
-                        metadata[key] = []
-                    metadata[key].append(value)
+                metadata = item_data.get("metadata", {})
+                
+                # Helper to get first value from metadata
+                def get_first(key):
+                    values = metadata.get(key, [])
+                    return values[0].get("value", "") if values else ""
+                
+                # Helper to get all values from metadata
+                def get_all(key):
+                    values = metadata.get(key, [])
+                    return [v.get("value", "") for v in values]
                 
                 # Build structured item
                 structured_item = {
-                    "uuid": item.get("uuid"),
-                    "handle": item.get("handle"),
-                    "title": " ".join(metadata.get("dc.title", [])),
-                    "abstract": " ".join(metadata.get("dc.description.abstract", [])),
-                    "authors": metadata.get("dc.contributor.author", []),
-                    "subjects": metadata.get("dc.subject", []),
-                    "date": metadata.get("dc.date.issued", [None])[0],
-                    "url": f"{base_url}/handle/{item.get('handle', '')}",
+                    "uuid": item_data.get("uuid"),
+                    "handle": item_data.get("handle"),
+                    "title": get_first("dc.title"),
+                    "abstract": get_first("dc.description.abstract") or get_first("dc.description"),
+                    "authors": get_all("dc.contributor.author"),
+                    "subjects": get_all("dc.subject"),
+                    "date": get_first("dc.date.issued") or get_first("dc.date.accessioned"),
+                    "url": f"{base_url}/handle/{item_data.get('handle', '')}",
                     "university": university
                 }
                 
                 items.append(structured_item)
             
-            print(f"  ✓ Processed {len(items)} items (offset: {offset})")
+            print(f"  ✓ Processed {len(items)} items (page: {page})")
             
-            offset += limit
+            # Check if there are more pages
+            page_info = data.get("page", {})
+            total_pages = page_info.get("totalPages", 1)
+            
+            page += 1
+            if page >= total_pages:
+                break
+            
             time.sleep(1)  # Be nice to the server
             
         except Exception as e:
-            print(f"  ⚠️ Error at offset {offset}: {e}")
+            print(f"  ⚠️ Error at page {page}: {e}")
             break
     
     print(f"✅ {repo_name}: {len(items)} items harvested")
