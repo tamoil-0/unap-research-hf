@@ -20,7 +20,7 @@ RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
 
-RUN mkdir -p models_semantic
+COPY models_semantic/ ./models_semantic/
 
 EXPOSE 7860
 
