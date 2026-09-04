@@ -30,3 +30,5 @@ Construido para Hugging Face Spaces usando Docker.
 <!-- Security scan triggered at 2026-09-02 06:38:44 -->
 
 <!-- Security scan triggered at 2026-09-02 06:50:03 -->
+
+<!-- Security scan triggered at 2026-09-04 12:59:12 -->
